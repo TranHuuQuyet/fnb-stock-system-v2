@@ -1,7 +1,7 @@
 # FNB Stock System — Domain Model v1
 
 **Status:** Discovery / Design baseline  
-**Version:** 1.0  
+**Version:** 1.1  
 **Scope:** Core inventory and warehouse domain
 
 > This document translates the agreed business discussions into a first domain model. It is framework-agnostic: it is not an EF Core model or database schema yet.
@@ -32,7 +32,7 @@ Core operations:
 - Issue
 - Transfer
 - Adjustment
-- Waste / Disposal
+- Adjustment
 
 ---
 
@@ -100,7 +100,7 @@ Key attributes:
 | Id | Unique product identifier |
 | SKU | Business identifier |
 | Name | Product name |
-| Unit | Stock unit |
+| BaseUnit | Single base stock unit used by v1 |
 | TrackBatch | Whether inventory must identify a batch/lot |
 | TrackExpiry | Whether expiry must be tracked |
 | IsActive | Whether the product can be used |
@@ -111,6 +111,7 @@ Business rules:
 - Inactive products should not be used for new stock operations.
 - TrackExpiry should normally imply batch-level traceability.
 - A product that does not require batch tracking does not need a Batch record for normal inventory.
+- V1 does not implement unit conversion. All stock quantities use the Product BaseUnit.
 
 ---
 
@@ -158,17 +159,17 @@ Key attributes:
 | BatchNumber | Supplier/manufacturer lot number |
 | ManufacturedAt | Optional manufacture date |
 | ExpiryDate | Optional expiry date |
-| Status | ACTIVE or EXPIRED |
+| ExpiryDate | Expiry date; source of truth for expiry |
 
 Business rules:
 
 - A batch belongs to exactly one Product.
 - Batch number must be traceable to receiving.
-- A batch becomes EXPIRED when its expiry date has passed.
-- Expired stock remains physically recorded.
-- Expired stock is not normally available for issue.
+- ExpiryDate is the source of truth for expiry.
+- A batch is considered expired when its expiry date has passed.
+- Expired stock remains physically recorded but is not available for normal issue.
+- Staff cannot manually change a batch to expired.
 - Expired stock cannot be manager-overridden for normal issue in v1.
-- Expired stock must be handled through Waste/Disposal.
 
 ---
 
@@ -252,6 +253,10 @@ Examples:
 
 For tracked products, a stock movement must retain the affected Batch.
 
+### 4.5 Immutable movement ledger
+
+An Inventory Movement cannot be edited after creation. If a correction is required, create a new corrective movement.
+
 ---
 
 ## 5. Inventory Movement
@@ -279,8 +284,9 @@ A movement should record at least:
 | ProductId | Product affected |
 | BatchId | Batch affected when applicable |
 | QuantityChange | Positive or negative change |
-| MovementType | RECEIPT / ISSUE / TRANSFER / ADJUSTMENT / WASTE |
-| ReferenceId | Source business operation |
+| MovementType | RECEIPT / ISSUE / TRANSFER_OUT / TRANSFER_IN / ADJUSTMENT / TRANSFER_DISCREPANCY |
+| ReferenceType | Type of source business operation |
+| ReferenceId | Identifier of source business operation |
 | CreatedBy | Actor |
 | CreatedAt | Timestamp |
 
@@ -403,8 +409,8 @@ Initial controlled values:
 - PRODUCTION
 - INTERNAL_CONSUMPTION
 - WASTE
-- EXPIRED
-- DAMAGED
+- EXPIRED_DISPOSAL
+- DAMAGED_DISPOSAL
 - OTHER
 
 Reason is required to explain the concrete business context.
@@ -421,6 +427,10 @@ Reason: Cleaning the kitchen area.
 Purpose: WASTE
 Reason: Product damaged during storage.
 ~~~
+
+### Waste / Disposal
+
+Waste and disposal are specialized Stock Issues in v1. There is no separate Waste aggregate or workflow.
 
 ### FEFO
 
@@ -453,6 +463,10 @@ StockTransfer
                  |
                  +--> Product
                  +--> Batch
+                 +--> RequestedQuantity
+                 +--> ShippedQuantity
+                 +--> ReceivedQuantity
+                 +--> TransferDiscrepancy
        |
        v
 Destination Warehouse
@@ -492,7 +506,26 @@ COMPLETED          DISCREPANCY
 
 The business lifecycle above is the baseline for implementation.
 
-### Transfer item
+### Transfer quantities
+
+A Transfer Item distinguishes Requested, Shipped, and Received quantities.
+
+- RequestedQuantity: what the destination requested.
+- ShippedQuantity: what the source actually shipped.
+- ReceivedQuantity: what the destination actually received.
+
+Example:
+
+~~~
+Requested = 100
+Shipped   = 100
+Received  = 95
+Difference = 5
+~~~
+
+These quantities are not interchangeable.
+
+### Batch traceability
 
 A tracked product must identify the exact batch being transferred.
 
@@ -517,6 +550,16 @@ Source Inventory
 
 Transfer In Transit
        +100
+
+When receiving 95:
+
+Transfer In Transit
+       -95
+
+Destination Inventory
+       +95
+
+Remaining 5 -> discrepancy under review
 ~~~
 
 The destination does not receive the stock yet.
@@ -537,39 +580,70 @@ This preserves the fact that stock can physically be between warehouses.
 
 ## 9. Transfer Discrepancy
 
-A discrepancy occurs when received quantity differs from expected quantity.
+A discrepancy occurs when received quantity differs from the quantity shipped for a Transfer Item.
+
+A discrepancy belongs to a specific StockTransferItem, not only to the parent transfer.
 
 Example:
 
 ~~~
-Expected: 100
+Expected/Shipped: 100
 Received: 95
-Difference: -5
+Difference: 5
 ~~~
 
-The system must not silently discard the difference.
-
-A discrepancy records:
+### TransferDiscrepancy
 
 | Attribute | Meaning |
 |---|---|
 | Id | Discrepancy identifier |
-| TransferId | Related transfer |
-| ExpectedQuantity | Expected amount |
-| ReceivedQuantity | Actual amount |
-| Difference | Difference |
-| Reason | Explanation |
+| TransferItemId | Related transfer item |
+| ExpectedQuantity | Quantity expected from the transfer item |
+| ReceivedQuantity | Actual quantity received |
+| Difference | Unresolved quantity difference |
+| Reason | Human-readable explanation |
+| Disposition | Manager's resolution classification |
 | ReportedBy | Person reporting |
 | ResolvedBy | Manager handling it |
 | Status | OPEN / RESOLVED |
 | CreatedAt | Timestamp |
 | ResolvedAt | Timestamp |
 
-Partial receiving is allowed.
+### Disposition
 
-The remaining difference requires Manager review before the transfer is finally completed.
+Initial controlled values:
 
----
+- SHORTAGE
+- DAMAGED
+- LOST
+- OTHER
+
+The Manager must provide a reason when resolving a discrepancy.
+
+### Resolution rule
+
+The unresolved quantity must not silently disappear. When the Manager resolves the discrepancy, the resolution must produce the corresponding inventory movement(s).
+
+Examples:
+
+~~~
+SHORTAGE
+    -> TRANSFER_DISCREPANCY movement -5
+
+DAMAGED
+    -> appropriate disposal/waste movement -5
+
+LOST
+    -> TRANSFER_DISCREPANCY movement -5
+~~~
+
+Every resolved difference must remain traceable.
+
+### Completion rule
+
+A Transfer with an unresolved discrepancy cannot be finally completed.
+
+A partial receiving is allowed.
 
 ## 10. Stock Adjustment
 
@@ -615,37 +689,7 @@ Adjustment completion creates an Inventory Movement.
 
 ---
 
-## 11. Waste / Disposal
-
-Waste is a controlled stock-decreasing operation.
-
-Typical cases:
-
-- Expired stock
-- Damaged stock
-- Spoilage
-- Operational waste
-
-Example:
-
-~~~
-Batch M001
-Status: EXPIRED
-Quantity: 20
-
-Waste / Disposal
-Quantity: 20
-Reason: Expired milk
-       |
-       v
-Inventory Movement -20
-~~~
-
-The physical stock remains traceable until disposal is recorded.
-
----
-
-## 12. Supplier
+## 11. Supplier
 
 Represents an external source of received stock.
 
@@ -665,7 +709,7 @@ Full Procurement / Purchase Order management is out of scope for v1.
 
 ---
 
-## 13. User / Role / Permission
+## 12. User / Role / Permission
 
 Core roles:
 
@@ -698,7 +742,7 @@ The exact permission matrix will be defined during authorization design.
 
 ---
 
-## 14. Audit Entry
+## 13. Audit Entry
 
 Audit records answer:
 
@@ -726,7 +770,7 @@ Both are needed.
 
 ---
 
-## 15. Workflow Pattern
+## 14. Workflow Pattern
 
 The system intentionally reuses one common approval pattern.
 
@@ -789,7 +833,7 @@ COMPLETED
 
 ---
 
-## 16. FEFO Domain Rule
+## 15. FEFO Domain Rule
 
 FEFO is a domain operation, not merely a sorting function.
 
@@ -815,7 +859,7 @@ For products without expiry tracking, FEFO does not apply.
 
 ---
 
-## 17. Concurrency and Integrity
+## 16. Concurrency and Integrity
 
 The implementation must protect inventory from concurrent updates.
 
@@ -837,7 +881,7 @@ The exact EF Core / SQL Server concurrency mechanism will be decided during impl
 
 ---
 
-## 18. Relationships Summary
+## 17. Relationships Summary
 
 ~~~
 Supplier
@@ -888,7 +932,7 @@ Important operations
 
 ---
 
-## 19. Intentionally Out of Domain v1
+## 18. Intentionally Out of Domain v1
 
 - POS
 - Customer ordering
@@ -907,49 +951,68 @@ These remain future or post-v1 scope.
 
 ---
 
-## 20. Open Decisions Before ERD
+## 19. Open Decisions Before ERD
 
-The following should be resolved before final database design:
+Only decisions that genuinely require further design remain open:
 
-1. Unit-of-measure strategy: single base unit vs conversion.
-2. Batch-number uniqueness and supplier relationships.
-3. Exact rules for products without batch tracking.
-4. Transfer discrepancy resolution and whether unresolved discrepancies can block completion indefinitely.
-5. Exact permission matrix.
-6. Soft-delete / archive rules for master data.
-7. Inventory uniqueness constraints.
-8. Exact concurrency strategy.
-9. Whether receiving approval is mandatory in every scenario.
-10. Whether Waste should remain separate or be represented as a specialized Issue.
+1. Batch-number uniqueness scope and whether the same supplier batch number can exist for different suppliers/products.
+2. Soft-delete / archive rules for master data.
+3. Exact permission matrix.
+4. Exact SQL Server / EF Core concurrency mechanism.
+5. Exact database implementation of ReferenceType + ReferenceId.
+6. Whether receiving approval is mandatory in every business scenario or whether approved receipts can be completed directly by authorized staff.
 
-These are intentionally open rather than invented.
+The core inventory domain rules above are considered fixed for v1.
 
 ---
 
-## 21. Agreed Design Decisions
+## 20. Agreed Design Decisions
+
+### Inventory
 
 - Central Warehouse is a Warehouse with type CENTRAL.
 - Product can opt into batch and expiry tracking.
+- Products use one BaseUnit in v1; unit conversion is out of scope.
 - Expired stock remains physically recorded but is unavailable for normal issue.
+- ExpiryDate is the source of truth for expiry.
+- Staff cannot manually mark a batch expired.
 - No manager override for expired stock in v1.
+- Inventory does not store a separate AvailableQuantity in v1.
+- Inventory is unique by Warehouse + Product + Batch.
+- Direct inventory editing is not allowed.
+- Inventory quantity cannot become negative.
+- Reserved inventory is not part of v1.
+
+### Operations
+
 - Stock Issue requires approval.
 - Stock Adjustment requires approval.
 - Transfer requires approval and has an in-transit phase.
 - Transfer tracks exact batches where batch tracking applies.
+- Transfer distinguishes Requested, Shipped, and Received quantities.
 - Partial transfer receiving is allowed.
-- Transfer quantity differences create a discrepancy requiring Manager handling.
-- Inventory has On Hand and Available concepts.
-- In Transit is represented by the transfer, not destination inventory.
-- Reserved inventory is not part of v1.
+- A transfer discrepancy belongs to a TransferItem.
+- Unresolved discrepancies block final transfer completion.
+- Manager must resolve discrepancies with a disposition and reason.
+- Waste/disposal is modeled as Stock Issue purposes, not a separate operation.
 - FEFO is enforced for expiry-managed products.
+
+### Ledger and audit
+
 - Every material stock change creates an Inventory Movement.
+- Inventory Movement is immutable.
+- Corrections create new movements rather than modifying historical movements.
+- Inventory Movement identifies its source using ReferenceType + ReferenceId.
 - Important operations have audit information.
-- Direct inventory editing is not allowed.
-- Atomicity and concurrency are core inventory requirements.
 
----
+### Authorization
 
-## 22. Next Step
+- Users have roles and warehouse assignments.
+- Warehouse-scoped users can operate only on assigned warehouses.
+- Managers may be assigned to multiple warehouses.
+- SYSTEM_ADMIN is system-wide.
+
+## 21. Next Step
 
 Before implementation:
 
