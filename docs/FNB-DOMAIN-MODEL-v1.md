@@ -1,4 +1,4 @@
-# FNB Stock System — Domain Model v1
+# FNB Stock System — Domain Model v1.1
 
 **Status:** Discovery / Design baseline  
 **Version:** 1.1  
@@ -31,7 +31,6 @@ Core operations:
 - Receiving
 - Issue
 - Transfer
-- Adjustment
 - Adjustment
 
 ---
@@ -66,7 +65,7 @@ Core operations:
                    INVENTORY MOVEMENT
                             ^
                             |
-                    ADJUSTMENT / WASTE
+                    ADJUSTMENT
 ~~~
 
 Supporting concepts:
@@ -158,7 +157,6 @@ Key attributes:
 | ProductId | Product represented by the batch |
 | BatchNumber | Supplier/manufacturer lot number |
 | ManufacturedAt | Optional manufacture date |
-| ExpiryDate | Optional expiry date |
 | ExpiryDate | Expiry date; source of truth for expiry |
 
 Business rules:
@@ -261,7 +259,7 @@ An Inventory Movement cannot be edited after creation. If a correction is requir
 
 ## 5. Inventory Movement
 
-Inventory Movement is the historical ledger of stock changes.
+Inventory Movement is the immutable historical ledger of stock changes.
 
 Examples:
 
@@ -272,7 +270,7 @@ Examples:
 -30   TRANSFER_OUT
 +30   TRANSFER_IN
 -3    ADJUSTMENT
--10   WASTE
+-5    TRANSFER_DISCREPANCY
 ~~~
 
 A movement should record at least:
@@ -422,9 +420,12 @@ Purpose: PRODUCTION
 Reason: Prepare ingredients for evening shift.
 
 Purpose: INTERNAL_CONSUMPTION
-Reason: Cleaning the kitchen area.
+Reason: Ingredients used for staff meal.
 
-Purpose: WASTE
+Purpose: EXPIRED_DISPOSAL
+Reason: Milk passed its expiry date.
+
+Purpose: DAMAGED_DISPOSAL
 Reason: Product damaged during storage.
 ~~~
 
@@ -550,9 +551,13 @@ Source Inventory
 
 Transfer In Transit
        +100
+~~~
 
-When receiving 95:
+The destination does not receive the stock yet.
 
+When the destination receives 95:
+
+~~~
 Transfer In Transit
        -95
 
@@ -562,23 +567,7 @@ Destination Inventory
 Remaining 5 -> discrepancy under review
 ~~~
 
-The destination does not receive the stock yet.
-
-When the destination receives:
-
-~~~
-Transfer In Transit
-       -100
-
-Destination Inventory
-       +100
-~~~
-
-This preserves the fact that stock can physically be between warehouses.
-
----
-
-## 9. Transfer Discrepancy
+The unresolved quantity remains represented by the transfer until the discrepancy is resolved.\n\n## 9. Transfer Discrepancy
 
 A discrepancy occurs when received quantity differs from the quantity shipped for a Transfer Item.
 
@@ -918,6 +907,14 @@ StockTransfer
    +---- StockTransferItem ---- Product
                               |
                               +---- Batch
+                              |
+                              +---- TransferDiscrepancy
+
+User
+   |
+   +---- Role
+   |
+   +---- WarehouseAssignment ---- Warehouse
 
 All completed stock operations
              |
@@ -928,11 +925,7 @@ Important operations
              |
              v
        Audit Entry
-~~~
-
----
-
-## 18. Intentionally Out of Domain v1
+~~~\n\n## 18. Intentionally Out of Domain v1
 
 - POS
 - Customer ordering
